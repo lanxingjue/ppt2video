@@ -1,0 +1,2 @@
+file 'C:\Code\代码\ppt2video\mock_run_for_ffmpeg_test\audio\segment_1.wav'
+file 'C:\Code\代码\ppt2video\mock_run_for_ffmpeg_test\audio\segment_3.wav'
