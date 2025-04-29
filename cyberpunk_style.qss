@@ -1,0 +1,152 @@
+/* Cyberpunk Theme for PyQt App */
+
+/* Main Window and Base Widget */
+QMainWindow, QWidget {
+    background-color: #0a0f1a; /* Very dark blue/black */
+    color: #e0e0e0; /* Light grey default text */
+    font-family: "Share Tech Mono", "Consolas", "Courier New", monospace; /* Prioritize custom font */
+    font-size: 11pt;
+}
+
+/* Labels */
+QLabel {
+    color: #00ffff; /* Cyan */
+    font-weight: bold;
+    padding: 2px;
+    background: transparent; /* Ensure no accidental background */
+}
+
+/* Line Edits (Input Fields) */
+QLineEdit {
+    background-color: #1a1f2b; /* Slightly lighter dark blue */
+    color: #e0e0e0;
+    border: 1px solid #00ffff; /* Cyan border */
+    border-radius: 3px;
+    padding: 5px;
+    font-size: 10pt;
+}
+
+QLineEdit:focus {
+    border: 1px solid #ff00ff; /* Magenta border on focus */
+    background-color: #2a2f3b;
+}
+
+QLineEdit:disabled {
+    background-color: #252a35;
+    border: 1px solid #505060;
+    color: #707080;
+}
+
+
+/* Buttons */
+QPushButton {
+    background-color: transparent;
+    color: #00ffff; /* Cyan text */
+    border: 1px solid #00ffff; /* Cyan border */
+    border-radius: 4px;
+    padding: 6px 12px;
+    min-width: 80px; /* Minimum width */
+    font-weight: bold;
+}
+
+QPushButton:hover {
+    background-color: rgba(0, 255, 255, 0.1); /* Faint cyan glow */
+    border: 1px solid #80ffff; /* Brighter cyan border */
+    color: #ffffff;
+}
+
+QPushButton:pressed {
+    background-color: rgba(0, 255, 255, 0.2); /* Stronger cyan glow */
+    border: 1px solid #ffffff;
+    color: #ffffff;
+}
+
+QPushButton:disabled {
+    color: #505060;
+    border: 1px solid #505060;
+    background-color: transparent;
+}
+
+
+/* Text Edit (Log Output) */
+QTextEdit {
+    background-color: #050a10; /* Even darker background */
+    color: #00ff00; /* Electric green log text */
+    border: 1px solid #404050; /* Subtle dark border */
+    border-radius: 3px;
+    font-family: "Share Tech Mono", "Consolas", "Courier New", monospace;
+    font-size: 10pt;
+}
+
+/* Progress Bar */
+QProgressBar {
+    border: 1px solid #00ffff;
+    border-radius: 3px;
+    background-color: #1a1f2b;
+    text-align: center;
+    color: #e0e0e0; /* Text color on the bar */
+    font-weight: bold;
+}
+
+QProgressBar::chunk {
+    background-color: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0,
+                                      stop: 0 #00ffff, stop: 1 #00aaff); /* Cyan gradient */
+    border-radius: 2px;
+    margin: 1px; /* Small margin inside the border */
+}
+
+/* Scroll Bars (often needed for QTextEdit) */
+QScrollBar:vertical {
+    border: 1px solid #404050;
+    background: #1a1f2b;
+    width: 12px; /* Width of the scroll bar */
+    margin: 0px 0px 0px 0px;
+}
+QScrollBar::handle:vertical {
+    background: #00ffff; /* Cyan handle */
+    min-height: 20px; /* Minimum handle size */
+    border-radius: 5px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    border: none;
+    background: none;
+    height: 0px; /* Hide arrows */
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
+}
+
+QScrollBar:horizontal {
+    border: 1px solid #404050;
+    background: #1a1f2b;
+    height: 12px;
+    margin: 0px 0px 0px 0px;
+}
+QScrollBar::handle:horizontal {
+    background: #00ffff;
+    min-width: 20px;
+    border-radius: 5px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    border: none;
+    background: none;
+    width: 0px;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: none;
+}
+
+/* Message Box Styling (Optional, can be tricky) */
+QMessageBox {
+    background-color: #0a0f1a;
+}
+
+QMessageBox QLabel {
+    color: #e0e0e0; /* Standard text color */
+    font-weight: normal; /* Override bold label */
+}
+
+QMessageBox QPushButton {
+    min-width: 70px; /* Slightly smaller buttons in message boxes */
+    padding: 4px 8px;
+}

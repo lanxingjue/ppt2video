@@ -3,41 +3,122 @@ import logging
 import time
 import shutil
 from pathlib import Path
-import subprocess # 用于调用外部命令 (FFmpeg)
-import shlex     # 用于安全地构建命令行参数
-import wave      # 需要在 ASR 部分之外，为下面的函数使用
+import subprocess
+import shlex
+import wave
 import contextlib
+import configparser # 导入配置解析器
+import sys # 导入 sys
+os.environ['TQDM_DISABLE'] = '1' # <--- 在调用 Whisper 前设置环境变量禁用 TQDM
+import platform # 导入 platform
 
-try:
-    from PIL import Image # <--- 确保这一行存在
-except ImportError:
-    logging.error("缺少 'Pillow' 库。请运行 'pip install Pillow'。")
-    # exit()
-# --- 导入 ASR 相关库 (保持不变) ---
+# --- 配置解析 ---
+config = configparser.ConfigParser()
+config_path = Path(__file__).parent / 'config.ini'
+if config_path.exists():
+    try:
+        config.read(config_path, encoding='utf-8')
+        logging.info(f"成功加载配置文件: {config_path}")
+    except Exception as e:
+        logging.error(f"加载配置文件 {config_path} 时出错: {e}. 将使用默认配置。")
+else:
+    logging.warning(f"配置文件 {config_path} 未找到。将使用默认配置。")
+
+# --- 日志记录配置 ---
+log_level_str = config.get('General', 'logging_level', fallback='INFO').upper()
+log_level = getattr(logging, log_level_str, logging.INFO)
+logging.basicConfig(
+    level=log_level,
+    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# --- 导入其他库 ---
 try:
     import stable_whisper
 except ImportError:
     logging.error("缺少 'stable-ts' 库。请运行 'pip install stable-ts'。")
-    # exit()
+    sys.exit(1) # <--- 使用 sys.exit(1)
+try:
+    import opencc # 新增：导入 opencc 库
+except ImportError:
+    logging.warning("缺少 'opencc-python-reimplemented' 库，将无法进行繁简转换！")
+    opencc = None # 如果没有安装，设置为 None
+try:
+    from PIL import Image
+except ImportError:
+    logging.error("缺少 'Pillow' 库。请运行 'pip install Pillow'。")
+    sys.exit(1) # <--- 使用 sys.exit(1)
 
-# --- 配置 ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
 
-TARGET_WIDTH = 1280      # 目标视频宽度 (像素)
-# TARGET_HEIGHT = 720    # 目标视频高度 (像素) - FFmpeg 可以自动计算或需要指定
-TARGET_FPS = 24          # 目标视频帧率
-# TRANSITION_DURATION = 0.5 # 转场暂时移除
-WHISPER_MODEL = "base"   # 使用的 Whisper 模型
-DEFAULT_SLIDE_DURATION = 3.0 # 如果幻灯片无音频/备注，默认显示时长 (秒)
-SUBTITLE_FONT = 'Arial'  # 字幕字体 (确保系统支持，FFmpeg可能需要特定配置)
-SUBTITLE_FONTSIZE = 24   # 字幕字号
-SUBTITLE_COLOR = 'white' # 字幕颜色
-SUBTITLE_BG_COLOR = '0x000000@0.5' # 字幕背景色 (FFmpeg 格式: 0xRRGGBB@AA)
-FFMPEG_PATH = "ffmpeg"   # 假设 ffmpeg 在 PATH 中，否则指定完整路径
+
+
+def get_ffmpeg_path():
+    """Determines the path to the bundled ffmpeg executable."""
+    if getattr(sys, 'frozen', False):
+        # If the application is run as a bundle (frozen),
+        # find ffmpeg relative to the executable directory.
+        application_path = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(os.path.dirname(sys.executable))
+        # Adjust 'vendor' if you used a different folder name
+        ffmpeg_executable = application_path / "vendor" / "ffmpeg.exe"
+    else:
+        # If running as a normal script, try PATH or config
+        config = configparser.ConfigParser()
+        config_path = Path(__file__).parent / 'config.ini'
+        ffmpeg_in_config = 'ffmpeg' # Default
+        if config_path.exists():
+            try:
+                config.read(config_path, encoding='utf-8')
+                ffmpeg_in_config = config.get('Paths', 'ffmpeg_path', fallback='ffmpeg')
+            except Exception: pass # Ignore config errors here
+        # Check if the path from config/default exists or search PATH
+        ffmpeg_executable_found = shutil.which(ffmpeg_in_config)
+        if ffmpeg_executable_found:
+            ffmpeg_executable = Path(ffmpeg_executable_found)
+        else: # Fallback if not in PATH or config path invalid
+            logging.warning(f"FFmpeg not found via config ('{ffmpeg_in_config}') or system PATH when running as script.")
+            # Attempt to find it relative to the script in dev mode as a last resort
+            script_dir = Path(__file__).parent
+            dev_ffmpeg_path = script_dir / "vendor" / "ffmpeg.exe"
+            if dev_ffmpeg_path.exists():
+                logging.info(f"Found FFmpeg in development 'vendor' folder: {dev_ffmpeg_path}")
+                ffmpeg_executable = dev_ffmpeg_path
+            else:
+                logging.error("FFmpeg executable not found!")
+                return None # Indicate failure
+
+    if ffmpeg_executable and ffmpeg_executable.exists():
+        logging.info(f"Using FFmpeg at: {ffmpeg_executable}")
+        return str(ffmpeg_executable)
+    else:
+         logging.error(f"FFmpeg executable not found at expected path: {ffmpeg_executable}")
+         return None
+
+# --- 获取 FFmpeg 路径 ---
+FFMPEG_PATH_RESOLVED = get_ffmpeg_path()
+
+# --- 从 config 读取配置 ---
+TARGET_WIDTH = config.getint('Video', 'target_width', fallback=1280)
+TARGET_FPS = config.getint('Video', 'target_fps', fallback=24)
+WHISPER_MODEL = config.get('Audio', 'whisper_model', fallback='base')
+DEFAULT_SLIDE_DURATION = config.getfloat('Video', 'default_slide_duration', fallback=3.0)
+# 字幕样式现在从配置读取 (但可能需要进一步处理才能用于 FFmpeg)
+SUBTITLE_STYLE_CONFIG = config.get('Video', 'subtitle_style', fallback="force_style='FontName=Arial,FontSize=24'") # 简化默认值
+FFMPEG_PATH = config.get('Paths', 'ffmpeg_path', fallback='ffmpeg')
+
+
+
+# TARGET_WIDTH = 1280      # 目标视频宽度 (像素)
+# # TARGET_HEIGHT = 720    # 目标视频高度 (像素) - FFmpeg 可以自动计算或需要指定
+# TARGET_FPS = 24          # 目标视频帧率
+# # TRANSITION_DURATION = 0.5 # 转场暂时移除
+# WHISPER_MODEL = "base"   # 使用的 Whisper 模型
+# DEFAULT_SLIDE_DURATION = 3.0 # 如果幻灯片无音频/备注，默认显示时长 (秒)
+# SUBTITLE_FONT = 'Arial'  # 字幕字体 (确保系统支持，FFmpeg可能需要特定配置)
+# SUBTITLE_FONTSIZE = 24   # 字幕字号
+# SUBTITLE_COLOR = 'white' # 字幕颜色
+# SUBTITLE_BG_COLOR = '0x000000@0.5' # 字幕背景色 (FFmpeg 格式: 0xRRGGBB@AA)
+# FFMPEG_PATH = "ffmpeg"   # 假设 ffmpeg 在 PATH 中，否则指定完整路径
 
 # --- ASR 字幕生成函数 (基本保持不变) ---
 def get_wav_duration(filepath: Path) -> float:
@@ -69,7 +150,7 @@ def generate_subtitles(
     audio_paths: list[str | None],
     output_srt_path: Path,
     temp_dir: Path,
-    whisper_model_name: str = WHISPER_MODEL
+    # whisper_model_name: str = WHISPER_MODEL
 ) -> bool:
     """
     合并音频文件，使用 Whisper 生成 SRT 字幕文件。
@@ -83,7 +164,6 @@ def generate_subtitles(
         return False
 
     combined_audio_path = temp_dir / "combined_audio_for_asr.wav"
-
     # --- 使用 FFmpeg 合并音频 ---
     # 创建一个包含所有输入音频文件路径的文本文件 (safe way)
     concat_list_path = temp_dir / "audio_concat_list.txt"
@@ -96,7 +176,8 @@ def generate_subtitles(
         logging.info(f"为 FFmpeg 创建了音频合并列表: {concat_list_path.name}")
 
         cmd_concat = [
-            FFMPEG_PATH,
+            # FFMPEG_PATH,
+            FFMPEG_PATH_RESOLVED, # <--- 使用 FFMPEG_PATH_RESOLVED
             "-f", "concat",      # 使用 concat demuxer
             "-safe", "0",       # 允许非本地/相对路径 (如果需要)
             "-i", str(concat_list_path.resolve()), # 输入列表文件
@@ -108,42 +189,81 @@ def generate_subtitles(
         if result.stderr: logging.debug(f"FFmpeg (concat) stderr:\n{result.stderr}") # Debug 输出
         logging.info("使用 FFmpeg 合并音频完成。")
         # 可选删除列表文件: concat_list_path.unlink()
+        if concat_list_path.exists(): concat_list_path.unlink() # 清理列表文件
 
     except subprocess.CalledProcessError as e:
         logging.error(f"FFmpeg 合并音频失败。返回码: {e.returncode}")
-        logging.error(f"FFmpeg 命令: {' '.join(shlex.quote(c) for c in cmd_concat)}")
+        logging.error(f"FFmpeg 命令: {shlex.join(cmd_concat)}")
         logging.error(f"FFmpeg 错误输出:\n{e.stderr}")
+        if concat_list_path.exists(): concat_list_path.unlink() # 出错也尝试清理
         return False
     except FileNotFoundError:
-        logging.error(f"错误：找不到 '{FFMPEG_PATH}' 命令。请确保 FFmpeg 已安装并配置在系统 PATH 中。")
+        logging.error(f"错误：找不到 '{FFMPEG_PATH_RESOLVED}' 命令。") # 使用 FFMPEG_PATH_RESOLVED
+        if concat_list_path.exists(): concat_list_path.unlink()
         return False
     except Exception as e:
         logging.error(f"合并音频时发生错误: {e}", exc_info=True)
+        if concat_list_path.exists(): concat_list_path.unlink()
         return False
 
     # --- 后续 ASR 步骤保持不变 ---
+    model = None # 初始化 model 变量
+    original_tqdm_disable = os.environ.get('TQDM_DISABLE') # 保存原始值
+
+
     try:
-        logging.info(f"加载 Whisper 模型 '{whisper_model_name}'...")
+        logging.info(f"加载 Whisper 模型 '{WHISPER_MODEL}'...") # 使用全局配置
         asr_start_time = time.time()
-        model = stable_whisper.load_model(whisper_model_name)
+        model = stable_whisper.load_model(WHISPER_MODEL) # 使用全局配置
         logging.info("开始语音识别 (ASR)...")
-        result = model.transcribe(str(combined_audio_path), fp16=False, verbose=False)
+        # result = model.transcribe(str(combined_audio_path), fp16=False, verbose=False)
+        # 重点：这里移除 language='zh' 参数，让 Whisper 自动检测
+        result = model.transcribe(
+            str(combined_audio_path),
+            fp16=False,
+            verbose=False,
+            # language='zh' # 移除此行 (让 Whisper 自动检测语言)
+        )
         asr_end_time = time.time()
         logging.info(f"语音识别完成，耗时 {asr_end_time - asr_start_time:.2f} 秒。")
 
         logging.info(f"将结果格式化并保存到 {output_srt_path.name}...")
+        
         srt_content = srt_formatter(result)
+
+        # --- 繁简转换 (如果 opencc 可用) ---
+        if opencc:
+            try:
+                cc = opencc.OpenCC('t2s.json') # 创建转换器 (繁体 -> 简体)
+                srt_content = cc.convert(srt_content) # 执行转换
+                logging.info("成功使用 OpenCC 将字幕内容转换为简体。")
+            except Exception as e:
+                logging.error(f"OpenCC 转换 SRT 内容时出错: {e}。")
+        else:
+            logging.warning("由于 opencc-python-reimplemented 未安装，跳过繁简转换。")
+        # -------------------------------------
+        # 保存 SRT 内容
         with open(output_srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
         logging.info("SRT 字幕文件生成成功。")
         return True
     except Exception as e:
         logging.error(f"运行 Whisper ASR 或保存字幕时出错: {e}", exc_info=True)
-        return False
+        return False # 保持返回 False
     finally:
-        if 'model' in locals(): del model
-        # 可选删除合并后的音频: combined_audio_path.unlink()
+        # 恢复原始 TQDM_DISABLE 环境变量值
+        if original_tqdm_disable is None:
+            if 'TQDM_DISABLE' in os.environ: del os.environ['TQDM_DISABLE']
+        else:
+            os.environ['TQDM_DISABLE'] = original_tqdm_disable
 
+        if model is not None:
+             logging.debug("正在释放 Whisper 模型内存...")
+             del model # <--- 确保在这里删除模型对象
+             # 可以考虑加一个短暂的等待，虽然理论上 del 后引用计数为0就该释放了
+             # time.sleep(0.1)
+        # 可选删除合并后的音频，但这里不删，后面会随整个目录清理
+        # if combined_audio_path.exists(): combined_audio_path.unlink()
 
 # --- FFmpeg 核心功能函数 ---
 
@@ -152,107 +272,106 @@ def create_video_segment(
     duration: float,
     audio_path: Path | None,
     output_path: Path,
-    width: int,
-    fps: int
+    # width: int,
+    # fps: int
 ) -> bool:
-    """使用 FFmpeg 将单张图片和可选音频转换为视频片段 (采用分步处理)。"""
-    logging.info(f"  使用 FFmpeg 创建视频片段: {output_path.name} (时长: {duration:.2f}s)")
+    # 使用 TARGET_WIDTH 和 TARGET_FPS 全局变量
+    logging.info(f"  使用 FFmpeg 创建视频片段: {output_path.name} (目标时长: {duration:.3f}s)")
+
+    if FFMPEG_PATH_RESOLVED is None:
+         logging.error("FFmpeg 路径未解析，无法创建视频片段。")
+         return False
 
     temp_video_path = output_path.with_suffix(".temp_video.mp4") # 临时的无声视频文件
     step1_success = False
     step2_success = False
 
     # --- 步骤 1: 图片转为无声视频 ---
+    # 使用 -t 参数设置准确的时长
     cmd_step1 = [
-        FFMPEG_PATH,
-        "-loop", "1",
-        "-framerate", str(fps),
+        FFMPEG_PATH_RESOLVED, "-y", # 使用解析后的路径
+        "-loop", "1", "-framerate", str(TARGET_FPS),
         "-i", str(image_path.resolve()),
-        "-vf", f"scale={width}:-2:force_original_aspect_ratio=decrease,pad={width}:{width*9//16}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,fps={fps}",
-        "-t", str(duration),
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-an", # 明确无音频
-        str(temp_video_path.resolve())
+        # 保持视频滤镜不变 (缩放/填充/帧率/像素格式)
+        "-vf", f"scale={TARGET_WIDTH}:-2:force_original_aspect_ratio=decrease,pad={TARGET_WIDTH}:{TARGET_WIDTH*9//16}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,fps={TARGET_FPS}",
+        # !!! 关键: 使用传入的 duration !!!
+        "-t", f"{duration:.3f}", # 格式化为小数点后3位
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p", "-an", str(temp_video_path.resolve())
     ]
     try:
-        logging.debug(f"    执行 FFmpeg 命令 (步骤 1 - 图片转无声视频): {' '.join(shlex.quote(c) for c in cmd_step1)}")
+        logging.debug(f"    执行 FFmpeg 命令 (步骤 1 - 图片转无声视频): {shlex.join(cmd_step1)}") # 使用 shlex.join
         result1 = subprocess.run(cmd_step1, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
         if result1.stderr: logging.debug(f"    FFmpeg (step1) stderr:\n{result1.stderr}")
         logging.info(f"    步骤 1 成功: 已生成无声视频 {temp_video_path.name}")
         step1_success = True
     except subprocess.CalledProcessError as e:
         logging.error(f"  FFmpeg 创建无声视频失败: {temp_video_path.name}。返回码: {e.returncode}")
-        logging.error(f"  FFmpeg 命令: {' '.join(shlex.quote(c) for c in cmd_step1)}")
+        logging.error(f"  FFmpeg 命令: {shlex.join(cmd_step1)}")
         logging.error(f"  FFmpeg 标准错误输出:\n{e.stderr}")
-        logging.error(f"  FFmpeg 标准输出:\n{e.stdout}")
-        # 如果第一步失败，尝试清理临时文件并返回 False
         if temp_video_path.exists():
              try: temp_video_path.unlink()
              except OSError: pass
         return False
     except FileNotFoundError:
-        logging.error(f"错误：找不到 '{FFMPEG_PATH}' 命令。")
+        logging.error(f"错误：找不到 FFmpeg 命令 '{FFMPEG_PATH_RESOLVED}'。")
         return False
     except Exception as e:
         logging.error(f"  创建无声视频时发生未知错误 {temp_video_path.name}: {e}")
         return False
 
-    # --- 步骤 2: 合并无声视频和音频 (如果音频存在) ---
+    # --- 步骤 2: 合并无声视频和音频 (如果音频存在且有效) ---
     if step1_success:
-        if audio_path and audio_path.is_file() and audio_path.stat().st_size > 0:
+        # 检查 audio_path 是否有效，并且对应的目标时长大于一个很小的值
+        if audio_path and audio_path.is_file() and audio_path.stat().st_size > 100 and duration > 0.01:
             logging.info(f"    步骤 2: 合并视频与音频 {audio_path.name} 到 {output_path.name}")
             cmd_step2 = [
-                FFMPEG_PATH,
-                "-i", str(temp_video_path.resolve()), # 输入无声视频
-                "-i", str(audio_path.resolve()),    # 输入音频
-                "-c:v", "copy",                     # 视频流直接复制 (因为编码已在步骤1完成)
-                "-c:a", "aac",                      # 音频编码
+                FFMPEG_PATH_RESOLVED, "-y", # 使用解析后的路径
+                "-i", str(temp_video_path.resolve()),
+                "-i", str(audio_path.resolve()),
+                "-c:v", "copy",
+                "-c:a", "aac", # 转为 AAC
                 "-b:a", "128k",
-                "-shortest",                        # 以最短输入结束
-                str(output_path.resolve())          # 最终输出
+                # 使用 -shortest 确保输出时长以最短输入为准，理论上视频和音频应该匹配了
+                "-shortest",
+                str(output_path.resolve())
             ]
             try:
-                logging.debug(f"    执行 FFmpeg 命令 (步骤 2 - 合并音视频): {' '.join(shlex.quote(c) for c in cmd_step2)}")
+                logging.debug(f"    执行 FFmpeg 命令 (步骤 2 - 合并音视频): {shlex.join(cmd_step2)}") # 使用 shlex.join
                 result2 = subprocess.run(cmd_step2, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
                 if result2.stderr: logging.debug(f"    FFmpeg (step2) stderr:\n{result2.stderr}")
                 logging.info(f"    步骤 2 成功: 已合并音视频到 {output_path.name}")
                 step2_success = True
             except subprocess.CalledProcessError as e:
                 logging.error(f"  FFmpeg 合并音视频失败: {output_path.name}。返回码: {e.returncode}")
-                logging.error(f"  FFmpeg 命令: {' '.join(shlex.quote(c) for c in cmd_step2)}")
+                logging.error(f"  FFmpeg 命令: {shlex.join(cmd_step2)}")
                 logging.error(f"  FFmpeg 标准错误输出:\n{e.stderr}")
-                logging.error(f"  FFmpeg 标准输出:\n{e.stdout}")
-                # 合并失败，但无声视频已生成，可以保留它吗？或者算失败？这里算失败
                 step2_success = False
             except FileNotFoundError:
-                 logging.error(f"错误：找不到 '{FFMPEG_PATH}' 命令。")
+                 logging.error(f"错误：找不到 FFmpeg 命令 '{FFMPEG_PATH_RESOLVED}'。")
                  step2_success = False
             except Exception as e:
                  logging.error(f"  合并音视频时发生未知错误 {output_path.name}: {e}")
                  step2_success = False
             finally:
-                 # 无论合并成功与否，删除临时的无声视频文件
                  if temp_video_path.exists():
                      try: temp_video_path.unlink()
                      except OSError: pass
         else:
-            # 如果没有音频，直接将无声视频重命名/移动为最终输出
-            logging.info(f"    步骤 2: 无音频，直接使用无声视频 {temp_video_path.name} 作为输出 {output_path.name}")
+            # 如果没有音频或音频时长无效，直接重命名无声视频
+            logging.info(f"    步骤 2: 无有效音频或时长过短，直接使用无声视频 {temp_video_path.name} 作为输出 {output_path.name}")
             try:
                 shutil.move(str(temp_video_path.resolve()), str(output_path.resolve()))
                 step2_success = True
             except Exception as e:
-                 logging.error(f"重命名/移动无声视频失败: {e}")
+                 logging.error(f"    重命名无声视频失败: {e}")
                  step2_success = False
-                 # 如果移动失败，尝试删除临时文件
                  if temp_video_path.exists():
                       try: temp_video_path.unlink()
                       except OSError: pass
 
-    return step1_success and step2_success # 只有两步（或第一步+移动）都成功才算成功
+    return step1_success and step2_success
+
 
 def concatenate_videos(video_file_list_path: Path, output_path: Path) -> bool:
     """使用 FFmpeg concat demuxer 拼接视频文件。"""
@@ -288,7 +407,8 @@ import shlex # 确保导入 shlex
 
 def add_subtitles(input_video: Path, srt_file: Path, output_video: Path) -> bool:
     """
-    使用 FFmpeg 将 SRT 字幕硬编码到视频中 (改进路径处理)。
+    使用 FFmpeg 将 SRT 字幕硬编码到视频中。
+    应用来自 config.ini 的样式。
 
     Args:
         input_video: 输入视频文件的 Path 对象。
@@ -300,37 +420,49 @@ def add_subtitles(input_video: Path, srt_file: Path, output_video: Path) -> bool
     """
     logging.info(f"使用 FFmpeg 添加字幕到视频...")
 
-    # 直接使用 resolve() 获取绝对路径，交给 shlex.quote 处理特殊字符
-    # 注意：shlex.quote 在 Windows 上可能不会按预期处理反斜杠和冒号，
-    # FFmpeg 的 subtitles 滤镜对 Windows 路径有特殊要求。
-    # 尝试一种更可靠的 Windows 路径转义方法给 FFmpeg filter。
+    if FFMPEG_PATH_RESOLVED is None:
+         logging.error("FFmpeg 路径未解析，无法添加字幕。")
+         return False
+
+    # --- 获取字幕样式配置 ---
+    # 优先使用 config.ini 中的设置
+    # 'Video' section, 'subtitle_style_ffmpeg' key
+    ffmpeg_style_str = config.get(
+        'Video',
+        'subtitle_style_ffmpeg', # 使用新 Key 名，更明确
+        fallback="Fontsize=18,PrimaryColour=&H00FFFFFF,BackColour=&H9A000000,BorderStyle=1,Outline=1,Shadow=0.8,Alignment=2,MarginV=25" # 提供一个更合适的默认值
+    )
+    logging.info(f"使用的字幕样式 (force_style): {ffmpeg_style_str}")
+
+    # --- 准备 FFmpeg filtergraph ---
+    # 正确转义 SRT 文件路径给 FFmpeg filter
     srt_path_str = str(srt_file.resolve())
-    # FFmpeg 滤镜路径需要转义 '\' 为 '\\' 或 '/'，并且转义 ':' 为 '\:'
-    srt_path_escaped_for_filter = srt_path_str.replace('\\', '/').replace(':', '\\:')
+    if platform.system() == "Windows":
+         # Windows 路径转义: \ -> /, : -> \:
+         srt_path_escaped_for_filter = srt_path_str.replace('\\', '/').replace(':', r'\:')
+    else:
+         # Linux/macOS 通常只需要处理特殊字符，但这里简单处理
+         srt_path_escaped_for_filter = srt_path_str.replace("'", r"\'") # 基本转义
+
+    # 构建 filtergraph，应用 force_style
+    vf_filter = f"subtitles='{srt_path_escaped_for_filter}':force_style='{ffmpeg_style_str}'"
 
     input_video_str = str(input_video.resolve())
     output_video_str = str(output_video.resolve())
 
-    # 构建 filtergraph 字符串，使用转义后的路径
-    # 先尝试不带 force_style
-    vf_filter = f"subtitles='{srt_path_escaped_for_filter}'"
-    # 如果需要 force_style (确保字体文件可用或使用通用字体名):
-    # style_options = f"FontName={SUBTITLE_FONT},FontSize={SUBTITLE_FONTSIZE}" # 简化版
-    # vf_filter = f"subtitles='{srt_path_escaped_for_filter}':force_style='{style_options}'"
-
+    # --- 构建 FFmpeg 命令 ---
     cmd_list = [
-        FFMPEG_PATH,
+        FFMPEG_PATH_RESOLVED, "-y", # 使用解析后的路径，允许覆盖
         "-i", input_video_str,
         "-vf", vf_filter,
         "-c:v", "libx264",
-        "-preset", "medium", # 可以根据需要调整速度 vs 压缩率
-        "-crf", "22",       # 调整视频质量 (18-28 常用)
+        "-preset", "medium", # 平衡速度和质量
+        "-crf", "22",       # 调整视频质量
         "-c:a", "copy",     # 直接复制音频流
         output_video_str
     ]
     try:
-        # 使用 shlex.join 打印命令更安全可靠
-        logging.debug(f"  执行 FFmpeg 命令: {shlex.join(cmd_list)}")
+        logging.debug(f"  执行 FFmpeg 命令 (添加字幕): {shlex.join(cmd_list)}")
         result = subprocess.run(cmd_list, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
         if result.stderr: logging.debug(f"  FFmpeg (subtitles) stderr:\n{result.stderr}")
         logging.info(f"字幕添加成功: {output_video.name}")
@@ -339,10 +471,9 @@ def add_subtitles(input_video: Path, srt_file: Path, output_video: Path) -> bool
         logging.error(f"FFmpeg 添加字幕失败。返回码: {e.returncode}")
         logging.error(f"FFmpeg 命令: {shlex.join(cmd_list)}")
         logging.error(f"FFmpeg 标准错误输出:\n{e.stderr}")
-        logging.error(f"FFmpeg 标准输出:\n{e.stdout}")
         return False
     except FileNotFoundError:
-         logging.error(f"错误：找不到 '{FFMPEG_PATH}' 命令。")
+         logging.error(f"错误：找不到 FFmpeg 命令 '{FFMPEG_PATH_RESOLVED}'。")
          return False
     except Exception as e:
          logging.error(f"添加字幕时发生未知错误: {e}")
@@ -356,7 +487,7 @@ def create_video_from_data(
 ) -> bool:
     """
     根据处理好的数据，使用 FFmpeg 合成最终视频 (无转场)。
-    添加了对生成的 SRT 文件是否有效的检查。
+    确保使用正确的音频时长，并应用字幕样式。
 
     Args:
         processed_data: 字典列表，包含幻灯片信息。
@@ -370,10 +501,13 @@ def create_video_from_data(
     if not processed_data:
         logging.error("输入数据为空，无法合成视频。")
         return False
+    if FFMPEG_PATH_RESOLVED is None:
+         logging.error("FFmpeg 路径未设置，无法合成视频。")
+         return False
 
     temp_segments_dir = temp_run_dir / "video_segments"
     temp_segments_dir.mkdir(exist_ok=True)
-    segment_files = [] # 存储成功生成的视频片段路径
+    segment_files = []
 
     # --- 1. 生成各幻灯片的视频片段 ---
     logging.info("步骤 1: 使用 FFmpeg 生成各幻灯片的视频片段")
@@ -381,147 +515,146 @@ def create_video_from_data(
         slide_num = data.get('slide_number', i + 1)
         image_path_str = data.get('image_path')
         audio_path_str = data.get('audio_path')
-        duration = data.get('audio_duration', 0.0)
+        # !!! 关键: 获取准确的时长 !!!
+        duration = data.get('audio_duration') # 从传入数据获取
 
         if not image_path_str or not Path(image_path_str).is_file():
             logging.warning(f"幻灯片 {slide_num}: 图片路径无效或丢失。跳过此片段。")
             continue
 
         image_path = Path(image_path_str)
-        audio_path = Path(audio_path_str) if audio_path_str else None
+        audio_path = Path(audio_path_str) if audio_path_str and Path(audio_path_str).is_file() else None
 
-        clip_duration = duration if duration > 0.01 else DEFAULT_SLIDE_DURATION
+        # --- 确定片段时长 ---
+        clip_duration = 0.0
+        if duration is not None and duration > 0.01: # 检查时长是否有效 (>0.01s)
+            clip_duration = duration
+            logging.debug(f"幻灯片 {slide_num}: 使用音频时长 {clip_duration:.3f}s")
+        else:
+            # 如果 duration 无效 (None, 0, 或太小)，使用默认时长
+            clip_duration = DEFAULT_SLIDE_DURATION
+            if audio_path:
+                logging.warning(f"幻灯片 {slide_num}: 音频时长无效或过短({duration}), 使用默认展示时长 {clip_duration}s")
+            else:
+                logging.info(f"幻灯片 {slide_num}: 无音频，使用默认展示时长 {clip_duration}s")
+        # --- ----------------- ---
+
         segment_output_path = temp_segments_dir / f"segment_{slide_num}.mp4"
 
         success = create_video_segment(
             image_path,
-            clip_duration,
-            audio_path,
+            clip_duration, # <<< 传递最终确定的时长
+            audio_path if clip_duration == duration else None, # 如果用了默认时长，则不合并音频
             segment_output_path,
-            TARGET_WIDTH,
-            TARGET_FPS
+            # TARGET_WIDTH 和 TARGET_FPS 从全局配置读取，无需传递
         )
         if success:
             segment_files.append(segment_output_path)
         else:
             logging.error(f"未能创建幻灯片 {slide_num} 的视频片段。合成中止。")
-            return False # 一个片段失败就中止
+            return False
 
     if not segment_files:
         logging.error("未能成功生成任何视频片段。")
         return False
 
-    # --- 2. 拼接视频片段 ---
+    # --- 2. 拼接视频片段 (保持不变) ---
     logging.info("步骤 2: 使用 FFmpeg 拼接视频片段")
     concat_list_file = temp_run_dir / "video_concat_list.txt"
     try:
         with open(concat_list_file, 'w', encoding='utf-8') as f:
             for segment_file in segment_files:
-                # 使用正斜杠，ffmpeg concat demuxer 对其兼容性更好
                 safe_path = str(segment_file.resolve()).replace('\\', '/')
                 f.write(f"file '{safe_path}'\n")
     except Exception as e:
         logging.error(f"创建视频拼接列表文件时出错: {e}")
         return False
-
-    base_video_path = temp_run_dir / "base_video_no_subs.mp4" # 拼接后无字幕的基础视频
-    success = concatenate_videos(concat_list_file, base_video_path)
-    if not success:
-        logging.error("拼接视频片段失败。")
+    base_video_path = temp_run_dir / "base_video_no_subs.mp4"
+    success_concat = concatenate_videos(concat_list_file, base_video_path)
+    if concat_list_file.exists():
         try: concat_list_file.unlink()
         except OSError: pass
+    if not success_concat:
+        logging.error("拼接视频片段失败。")
         return False
-    try: concat_list_file.unlink()
-    except OSError: pass
 
-    # --- 3. 生成字幕 (如果需要) ---
+    # --- 3. 生成字幕 (保持不变) ---
     logging.info("步骤 3: 生成字幕文件 (ASR)")
-    audio_segment_paths = [d.get('audio_path') for d in processed_data]
+    audio_segment_paths = [d.get('audio_path') for d in processed_data if d.get('audio_duration', 0) > 0.01] # 只合并有效音频
     subtitle_file_path = temp_run_dir / "subtitles.srt"
-    subtitles_generated = generate_subtitles(
-        audio_segment_paths,
-        subtitle_file_path,
-        temp_run_dir
-    )
+    subtitles_generated = False
+    if audio_segment_paths: # 只有存在有效音频时才尝试生成字幕
+        subtitles_generated = generate_subtitles(
+            audio_segment_paths,
+            subtitle_file_path,
+            temp_run_dir
+        )
+    else:
+        logging.info("没有有效时长的音频文件，跳过字幕生成。")
 
-    # --- 检查生成的 SRT 文件是否有效 (非空且包含文本) ---
+
+    # --- 检查 SRT 文件有效性 (保持不变) ---
     srt_is_valid = False
     if subtitles_generated and subtitle_file_path.exists():
+        # ... (之前的 srt_is_valid 检查逻辑不变) ...
         try:
-            if subtitle_file_path.stat().st_size > 10: # 基础大小检查
+            if subtitle_file_path.stat().st_size > 5: # 稍微降低阈值
                 with open(subtitle_file_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         line_strip = line.strip()
-                        # 检查是否包含有效文本行 (不是空行, 不是纯数字序列号, 不是时间戳)
                         if line_strip and not line_strip.isdigit() and '-->' not in line_strip:
                             srt_is_valid = True
-                            break # 找到一个有效文本行就足够了
-                if srt_is_valid:
-                    logging.info("生成的 SRT 字幕文件包含有效文本。")
-                else:
-                     logging.warning("生成的 SRT 文件为空或不包含有效文本内容。")
-            else:
-                logging.warning("生成的 SRT 文件为空。")
-        except Exception as e:
-            logging.warning(f"检查 SRT 文件时出错: {e}")
+                            break
+                if srt_is_valid: logging.info("生成的 SRT 字幕文件包含有效文本。")
+                else: logging.warning("生成的 SRT 文件为空或不包含有效文本内容。")
+            else: logging.warning("生成的 SRT 文件过小或为空。")
+        except Exception as e: logging.warning(f"检查 SRT 文件时出错: {e}")
 
-    # --- 4. 添加字幕到视频 (仅当 SRT 文件有效时) ---
-    if srt_is_valid: # <--- 使用检查结果
+    # --- 4. 添加字幕 (调用修改后的 add_subtitles) ---
+    if srt_is_valid:
         logging.info("步骤 4: 使用 FFmpeg 添加字幕")
         final_video_with_subs_path = temp_run_dir / "final_video_with_subs.mp4"
-        success = add_subtitles(base_video_path, subtitle_file_path, final_video_with_subs_path)
-        if success:
+        # 调用修改后的 add_subtitles 函数，它会读取 config 的样式
+        success_sub = add_subtitles(base_video_path, subtitle_file_path, final_video_with_subs_path)
+        if success_sub:
             logging.info("字幕添加成功。将带有字幕的视频作为最终输出。")
             try:
                  shutil.move(str(final_video_with_subs_path), str(output_video_path))
                  logging.info(f"最终视频 (带字幕) 已保存到: {output_video_path}")
-                 try: base_video_path.unlink() # 清理无字幕基础视频
-                 except OSError: pass
-                 return True # 整个流程成功
+                 if base_video_path.exists(): base_video_path.unlink(missing_ok=True)
+                 return True
             except Exception as e:
-                 logging.error(f"移动最终带字幕视频时出错: {e}. 最终文件可能仍在临时目录: {final_video_with_subs_path}")
+                 logging.error(f"移动最终带字幕视频时出错: {e}. 文件可能在: {final_video_with_subs_path}")
                  return False
         else:
             logging.error("添加字幕失败。将输出不带字幕的视频。")
-            # 添加字幕失败，则回退到输出不带字幕的视频
+            # 回退逻辑不变
             try:
                  shutil.move(str(base_video_path), str(output_video_path))
                  logging.info(f"最终视频 (无字幕 - 因添加失败) 已保存到: {output_video_path}")
-                 return True # 流程算成功，但功能未完全实现
+                 return True
             except Exception as e:
-                 logging.error(f"移动最终无字幕视频时出错: {e}. 最终文件可能仍在临时目录: {base_video_path}")
+                 logging.error(f"移动最终无字幕视频时出错: {e}. 文件可能在: {base_video_path}")
                  return False
     else:
-        # 如果 SRT 无效或生成失败，则直接输出不带字幕的视频
-        logging.info("步骤 4: 跳过添加字幕 (文件为空、无效或生成失败)。")
+        # 跳过添加字幕逻辑不变
+        logging.info("步骤 4: 跳过添加字幕 (文件无效或生成失败)。")
         try:
              shutil.move(str(base_video_path), str(output_video_path))
              logging.info(f"最终视频 (无字幕) 已保存到: {output_video_path}")
              return True
         except Exception as e:
-             logging.error(f"移动最终无字幕视频时出错: {e}. 最终文件可能仍在临时目录: {base_video_path}")
+             logging.error(f"移动最终无字幕视频时出错: {e}. 文件可能在: {base_video_path}")
              return False
 
-    # 清理逻辑已包含在上面的移动操作中，这里不再需要单独的清理步骤
-    # （除非你想在失败时也清理临时片段，但保留它们有助于调试）
 
-    # --- 5. 清理临时视频片段 ---
-    # 注意：这步实际上被上面的移动操作覆盖了，如果移动成功，应该在移动后清理
-    # 这里保留逻辑以防未来修改
-    # logging.info("步骤 5: 清理临时视频片段文件...")
-    # try:
-    #     shutil.rmtree(temp_segments_dir)
-    # except OSError as e:
-    #     logging.warning(f"清理临时视频片段目录时出错: {e}")
-
-    # return True # 如果代码能执行到这里，说明前面的步骤都成功了
 
 
 # --- 主程序入口与测试 (使用 FFmpeg 版本) ---
 # --- 主程序入口与测试 (使用 FFmpeg 版本 + 真实语音模拟) ---
 if __name__ == "__main__":
     logging.info("--- 开始测试基于 FFmpeg 的视频合成模块 (使用 TTS 生成模拟语音) ---")
-
+    logging.info("--- 开始测试基于 FFmpeg 的视频合成模块 (使用 config.ini) ---")
     # --- 引入 TTS 库 ---
     try:
         import pyttsx3

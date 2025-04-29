@@ -1,0 +1,9 @@
+pyqt6
+edge-tts
+mutagen
+python-pptx
+pyttsx3 
+stable-ts
+pdf2image
+opencc-python-reimplemented
+moviepy
